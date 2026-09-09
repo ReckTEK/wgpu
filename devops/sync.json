@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "repository": "ReckTEK/wgpu",
+  "upstream": "gfx-rs/wgpu",
+  "branch": "main",
+  "seedBranch": "trunk",
+  "upstreamBranch": "trunk",
+  "mirrorSourceRelease": false,
+  "holdUpstreamBuilds": true
+}
