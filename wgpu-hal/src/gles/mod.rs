@@ -357,6 +357,7 @@ pub struct ShaderClearProgram {
 #[derive(Debug)]
 pub struct Queue {
     shared: Arc<AdapterShared>,
+    main_vao: glow::VertexArray,
     features: wgt::Features,
     draw_fbo: glow::Framebuffer,
     copy_fbo: glow::Framebuffer,

@@ -42,6 +42,11 @@ Bottom level categories:
 
 ## Unreleased
 
+### ReckTEK native integration
+
+- Preserve native mapped-buffer copy lifetimes and reject stale or unwritable mappings.
+- Restore the correct GLES vertex array when multiple devices share a context.
+
 ### Major changes
 
 #### `TEXTURE_COMPONENT_SWIZZLE` feature and `swizzle` field in `TextureViewDescriptor`

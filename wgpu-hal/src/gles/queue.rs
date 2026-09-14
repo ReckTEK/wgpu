@@ -86,6 +86,8 @@ impl super::Queue {
     }
 
     unsafe fn reset_state(&self, gl: &glow::Context) {
+        // Devices share this context; another device may have bound or deleted its VAO.
+        unsafe { gl.bind_vertex_array(Some(self.main_vao)) };
         unsafe { gl.use_program(None) };
         unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
         unsafe { gl.disable(glow::DEPTH_TEST) };

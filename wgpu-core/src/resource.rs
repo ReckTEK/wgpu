@@ -9,6 +9,7 @@ use core::{
 };
 use smallvec::SmallVec;
 use thiserror::Error;
+use wgpu_sync::atomic::{AtomicU64, Ordering};
 use wgt::{
     error::{ErrorType, WebGpuError},
     math::align_to,
@@ -262,6 +263,14 @@ pub(crate) enum BufferMapState {
     Idle,
 }
 
+/// The externally observable mapping state. A newly created mapping is writable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferMapStatus {
+    Unmapped,
+    Pending,
+    Mapped { writable: bool },
+}
+
 #[cfg(send_sync)]
 unsafe impl Send for BufferMapState {}
 #[cfg(send_sync)]
@@ -458,6 +467,7 @@ pub struct Buffer {
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
     pub(crate) map_state: Mutex<BufferMapState>,
+    pub(crate) map_generation: AtomicU64,
     // Bind groups that reference this buffer. May contain duplicates.
     pub(crate) bind_groups: Mutex<WeakVec<BindGroup>>,
     pub(crate) timestamp_normalization_bind_group: Snatchable<TimestampNormalizationBindGroup>,
@@ -582,6 +592,7 @@ impl Buffer {
                 BufferInitTracker::new(0),
             ),
             map_state: Mutex::new(rank::BUFFER_MAP_STATE, BufferMapState::Idle),
+            map_generation: AtomicU64::new(0),
             label: desc.label.to_string(),
             tracking_data: TrackingData::new(device.tracker_indices.buffers.clone()),
             bind_groups: Mutex::new(rank::BUFFER_BIND_GROUPS, WeakVec::new()),
@@ -884,6 +895,19 @@ impl Buffer {
         }
     }
 
+    pub fn map_status(&self) -> Result<BufferMapStatus, BufferAccessError> {
+        self.check_is_valid()?;
+        let state = self.map_state.lock();
+        Ok(match *state {
+            BufferMapState::Idle => BufferMapStatus::Unmapped,
+            BufferMapState::Waiting(_) => BufferMapStatus::Pending,
+            BufferMapState::Init { .. } => BufferMapStatus::Mapped { writable: true },
+            BufferMapState::Active { host, .. } => BufferMapStatus::Mapped {
+                writable: host == HostMap::Write,
+            },
+        })
+    }
+
     pub fn get_mapped_range(
         self: &Arc<Self>,
         offset: wgt::BufferAddress,
@@ -895,6 +919,18 @@ impl Buffer {
             Arc::as_ptr(self)
         );
 
+        self.with_mapped_range(offset, size, false, |ptr, size, _| (ptr, size))
+    }
+
+    /// Keeps the mapping alive while a native client copies a validated range.
+    /// The callback must not call into this device while the mapping is locked.
+    pub fn with_mapped_range<R>(
+        self: &Arc<Self>,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferAddress>,
+        writable: bool,
+        access: impl FnOnce(NonNull<u8>, u64, u64) -> R,
+    ) -> Result<R, BufferAccessError> {
         self.check_is_valid()?;
         {
             let snatch_guard = self.device.snatchable_lock.read();
@@ -914,6 +950,7 @@ impl Buffer {
             return Err(BufferAccessError::UnalignedRangeSize { range_size });
         }
         let map_state = &*self.map_state.lock();
+        let generation = self.map_generation.load(Ordering::Relaxed);
         match *map_state {
             BufferMapState::Init { ref staging_buffer } => {
                 if offset > self.size {
@@ -932,13 +969,16 @@ impl Buffer {
                 }
                 let ptr = unsafe { staging_buffer.ptr() };
                 let ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr().offset(offset as isize)) };
-                Ok((ptr, range_size))
+                Ok(access(ptr, range_size, generation))
             }
             BufferMapState::Active {
                 ref mapping,
                 ref range,
-                ..
+                host,
             } => {
+                if writable && host != HostMap::Write {
+                    return Err(BufferAccessError::Failed);
+                }
                 if offset > range.end {
                     return Err(BufferAccessError::OutOfBoundsStartOffsetOverrun {
                         index: offset,
@@ -962,9 +1002,10 @@ impl Buffer {
                 // rather than the beginning of the buffer.
                 let relative_offset = (offset - range.start) as isize;
                 unsafe {
-                    Ok((
+                    Ok(access(
                         NonNull::new_unchecked(mapping.ptr.as_ptr().offset(relative_offset)),
                         range_size,
+                        generation,
                     ))
                 }
             }
@@ -1060,7 +1101,11 @@ impl Buffer {
         // - if the device was invalid from the start it couldn't have been mapped via `map_async` anyway
         // - if the buffer was destroyed (via `Buffer::destroy`) it was first unmapped
         let raw_buf = self.try_raw(&snatch_guard).ok()?;
-        let map_state = mem::replace(&mut *self.map_state.lock(), BufferMapState::Idle);
+        let map_state = {
+            let mut map_state = self.map_state.lock();
+            self.map_generation.fetch_add(1, Ordering::Relaxed);
+            mem::replace(&mut *map_state, BufferMapState::Idle)
+        };
         match map_state {
             BufferMapState::Init { staging_buffer } => {
                 #[cfg(feature = "trace")]
@@ -3654,3 +3699,169 @@ crate::impl_labeled!(Tlas);
 crate::impl_parent_device!(Tlas);
 crate::impl_storage_item!(Tlas);
 crate::impl_trackable!(Tlas);
+
+#[cfg(all(test, feature = "noop"))]
+mod native_mapping_tests {
+    use super::*;
+    use crate::{device::queue::Queue, instance::Instance};
+
+    fn device() -> (Arc<Device>, Arc<Queue>) {
+        let instance = Instance::new(
+            "native mapping tests",
+            wgt::InstanceDescriptor {
+                backends: wgt::Backends::NOOP,
+                flags: wgt::InstanceFlags::VALIDATION,
+                backend_options: wgt::BackendOptions {
+                    noop: wgt::NoopBackendOptions::enabled(),
+                    ..Default::default()
+                },
+                ..wgt::InstanceDescriptor::new_without_display_handle()
+            },
+            None,
+        );
+        instance
+            .request_adapter(&Default::default(), wgt::Backends::NOOP)
+            .unwrap()
+            .request_device(&Default::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn mapped_range_permissions_and_generation_follow_mapping_lifetime() {
+        let (device, _queue) = device();
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 32,
+            usage: wgt::BufferUsages::MAP_READ | wgt::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        assert_eq!(
+            buffer.map_status().unwrap(),
+            BufferMapStatus::Mapped { writable: true }
+        );
+        let initial_generation = buffer
+            .with_mapped_range(0, None, true, |ptr, size, generation| {
+                assert_eq!(size, 32);
+                unsafe { ptr.as_ptr().write(42) };
+                generation
+            })
+            .unwrap();
+        buffer.unmap();
+        assert_eq!(buffer.map_status().unwrap(), BufferMapStatus::Unmapped);
+        assert!(matches!(
+            buffer.with_mapped_range(0, Some(4), false, |_, _, _| ()),
+            Err(BufferAccessError::NotMapped)
+        ));
+
+        assert!(buffer
+            .map_async(
+                8,
+                Some(16),
+                BufferMapOperation {
+                    host: HostMap::Read,
+                    callback: Some(Box::new(|result| result.unwrap())),
+                },
+            )
+            .is_some());
+        assert_eq!(buffer.map_status().unwrap(), BufferMapStatus::Pending);
+        device.poll(wgt::PollType::Poll).unwrap();
+        assert_eq!(
+            buffer.map_status().unwrap(),
+            BufferMapStatus::Mapped { writable: false }
+        );
+        let generation = buffer
+            .with_mapped_range(8, Some(16), false, |_, size, generation| {
+                assert_eq!(size, 16);
+                generation
+            })
+            .unwrap();
+        assert_ne!(generation, initial_generation);
+        assert!(matches!(
+            buffer.with_mapped_range(8, Some(4), true, |_, _, _| ()),
+            Err(BufferAccessError::Failed)
+        ));
+        assert!(matches!(
+            buffer.with_mapped_range(0, Some(4), false, |_, _, _| ()),
+            Err(BufferAccessError::OutOfBoundsStartOffsetUnderrun { .. })
+        ));
+        assert!(matches!(
+            buffer.with_mapped_range(16, Some(12), false, |_, _, _| ()),
+            Err(BufferAccessError::OutOfBoundsEndOffsetOverrun { .. })
+        ));
+        buffer.destroy();
+        assert_eq!(buffer.map_status().unwrap(), BufferMapStatus::Unmapped);
+        assert!(matches!(
+            buffer.with_mapped_range(8, Some(4), false, |_, _, _| ()),
+            Err(BufferAccessError::DestroyedResource(_))
+        ));
+    }
+
+    #[cfg(send_sync)]
+    #[test]
+    fn mapped_copy_holds_mapping_until_callback_returns() {
+        use core::time::Duration;
+        use std::{sync::mpsc, thread};
+
+        let (device, _queue) = device();
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgt::BufferUsages::MAP_WRITE | wgt::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = buffer
+            .with_mapped_range(0, Some(4), true, |ptr, _, _| {
+                let worker_buffer = buffer.clone();
+                let worker = thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    worker_buffer.unmap();
+                    finished_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(matches!(
+                    finished_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                unsafe { ptr.as_ptr().write(42) };
+                worker
+            })
+            .unwrap();
+        worker.join().unwrap();
+        finished_rx.recv().unwrap();
+        assert_eq!(buffer.map_status().unwrap(), BufferMapStatus::Unmapped);
+    }
+
+    #[test]
+    fn destroyed_query_sets_cannot_be_submitted_before_or_after_encoding() {
+        let (device, queue) = device();
+        let query_set = device.create_query_set(&QuerySetDescriptor {
+            label: None,
+            ty: wgt::QueryType::Occlusion,
+            count: 1,
+        });
+        let destination = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgt::BufferUsages::QUERY_RESOLVE,
+            mapped_at_creation: false,
+        });
+        let encoder = device.create_command_encoder(&Default::default());
+        encoder.resolve_query_set(query_set.clone(), 0, 1, destination.clone(), 0);
+        let commands = encoder.finish(&Default::default());
+        query_set.destroy();
+        query_set.destroy();
+
+        device.push_error_scope(wgt::error::ErrorFilter::Validation);
+        queue.submit(&[commands]);
+        assert!(device.pop_error_scope().unwrap().is_some());
+
+        device.push_error_scope(wgt::error::ErrorFilter::Validation);
+        let encoder = device.create_command_encoder(&Default::default());
+        encoder.resolve_query_set(query_set, 0, 1, destination, 0);
+        let commands = encoder.finish(&Default::default());
+        queue.submit(&[commands]);
+        assert!(device.pop_error_scope().unwrap().is_some());
+    }
+}
