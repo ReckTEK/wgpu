@@ -932,10 +932,8 @@ impl Buffer {
         access: impl FnOnce(NonNull<u8>, u64, u64) -> R,
     ) -> Result<R, BufferAccessError> {
         self.check_is_valid()?;
-        {
-            let snatch_guard = self.device.snatchable_lock.read();
-            self.check_destroyed(&snatch_guard)?;
-        }
+        let snatch_guard = self.device.snatchable_lock.read();
+        self.check_destroyed(&snatch_guard)?;
 
         let range_size = if let Some(size) = size {
             size
@@ -1096,17 +1094,17 @@ impl Buffer {
         // - if the device was invalid from the start it couldn't have been mapped via `map_async` anyway
         // - if the device becomes invalid it calls the callback in `poll`/`maintain`
         self.device.check_is_valid().ok()?;
+        let queue = device.get_queue();
         let snatch_guard = device.snatchable_lock.read();
         // We can stop here if the buffer is invalid or destroyed because:
         // - if the device was invalid from the start it couldn't have been mapped via `map_async` anyway
         // - if the buffer was destroyed (via `Buffer::destroy`) it was first unmapped
         let raw_buf = self.try_raw(&snatch_guard).ok()?;
-        let map_state = {
-            let mut map_state = self.map_state.lock();
-            self.map_generation.fetch_add(1, Ordering::Relaxed);
-            mem::replace(&mut *map_state, BufferMapState::Idle)
-        };
-        match map_state {
+        // Staged mappings need pending writes; acquire that lock before the map lock.
+        let mut pending_writes = queue.as_ref().map(|queue| queue.pending_writes.lock());
+        let mut map_state = self.map_state.lock();
+        self.map_generation.fetch_add(1, Ordering::Relaxed);
+        match mem::replace(&mut *map_state, BufferMapState::Idle) {
             BufferMapState::Init { staging_buffer } => {
                 #[cfg(feature = "trace")]
                 if let Some(ref mut trace) = *device.trace.lock() {
@@ -1125,7 +1123,7 @@ impl Buffer {
 
                 let staging_buffer = staging_buffer.flush();
 
-                if let Some(queue) = device.get_queue() {
+                if let Some(pending_writes) = pending_writes.as_mut() {
                     // Copy the entire staging buffer, including any
                     // zero-initialized padding.
                     let region = Some(hal::BufferCopy {
@@ -1147,7 +1145,6 @@ impl Buffer {
                             to: wgt::BufferUses::COPY_DST,
                         },
                     };
-                    let mut pending_writes = queue.pending_writes.lock();
                     let encoder = pending_writes.activate();
                     unsafe {
                         encoder.transition_buffers(&[transition_src, transition_dst]);
@@ -3831,6 +3828,132 @@ mod native_mapping_tests {
         worker.join().unwrap();
         finished_rx.recv().unwrap();
         assert_eq!(buffer.map_status().unwrap(), BufferMapStatus::Unmapped);
+    }
+
+    #[cfg(send_sync)]
+    #[test]
+    fn mapped_copy_survives_device_and_buffer_destruction() {
+        use core::time::Duration;
+        use std::{sync::mpsc, thread};
+
+        let (device, _queue) = device();
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgt::BufferUsages::MAP_WRITE | wgt::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = buffer
+            .with_mapped_range(0, Some(4), true, |ptr, _, _| {
+                let worker_buffer = buffer.clone();
+                let worker_device = device.clone();
+                let worker = thread::spawn(move || {
+                    worker_device.destroy();
+                    started_tx.send(()).unwrap();
+                    worker_buffer.destroy();
+                    finished_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(!device.is_valid());
+                assert!(matches!(
+                    finished_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                unsafe { ptr.as_ptr().write(42) };
+                worker
+            })
+            .unwrap();
+        worker.join().unwrap();
+        finished_rx.recv().unwrap();
+        assert!(matches!(
+            buffer.with_mapped_range(0, Some(4), false, |_, _, _| ()),
+            Err(BufferAccessError::DestroyedResource(_))
+        ));
+    }
+
+    #[cfg(all(send_sync, feature = "trace"))]
+    #[test]
+    fn remapping_waits_for_previous_unmap_to_finish() {
+        use core::time::Duration;
+        use std::{sync::mpsc, thread, time::Instant};
+
+        for (usage, host) in [
+            (
+                wgt::BufferUsages::MAP_WRITE | wgt::BufferUsages::COPY_SRC,
+                HostMap::Write,
+            ),
+            (
+                wgt::BufferUsages::MAP_READ | wgt::BufferUsages::COPY_DST,
+                HostMap::Read,
+            ),
+        ] {
+            let (device, _queue) = device();
+            let buffer = device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: 16,
+                usage,
+                mapped_at_creation: true,
+            });
+            let generation = buffer.map_generation.load(Ordering::Relaxed);
+            // Stop unmap after changing its state but before flushing or unmapping HAL memory.
+            let trace_guard = device.trace.lock();
+            let unmap_buffer = buffer.clone();
+            let unmap_worker = thread::spawn(move || unmap_buffer.unmap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while buffer.map_generation.load(Ordering::Relaxed) == generation {
+                assert!(
+                    Instant::now() < deadline,
+                    "unmap did not reach the trace barrier"
+                );
+                thread::yield_now();
+            }
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (mapped_tx, mapped_rx) = mpsc::channel();
+            let map_buffer = buffer.clone();
+            let map_device = device.clone();
+            let map_worker = thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                assert!(map_buffer
+                    .map_async(
+                        0,
+                        Some(16),
+                        BufferMapOperation {
+                            host,
+                            callback: Some(Box::new(move |result| {
+                                result.unwrap();
+                                mapped_tx.send(()).unwrap();
+                            })),
+                        },
+                    )
+                    .is_some());
+                map_device.poll(wgt::PollType::Poll).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                mapped_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(trace_guard);
+
+            unmap_worker.join().unwrap();
+            map_worker.join().unwrap();
+            mapped_rx.recv().unwrap();
+            assert_eq!(
+                buffer.map_status().unwrap(),
+                BufferMapStatus::Mapped {
+                    writable: host == HostMap::Write
+                }
+            );
+            buffer
+                .with_mapped_range(0, Some(16), false, |ptr, _, _| unsafe {
+                    ptr.as_ptr().read()
+                })
+                .unwrap();
+            buffer.unmap();
+        }
     }
 
     #[test]
