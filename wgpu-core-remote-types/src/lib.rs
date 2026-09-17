@@ -145,4 +145,26 @@ pub struct ShaderModuleDescriptor<'a> {
 
 pub type QuerySetDescriptor<'a> = wgt::QuerySetDescriptor<Label<'a>>;
 
+/// Errors of <https://gpuweb.github.io/gpuweb/#dom-gpuadapter-requestdevice>
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum RequestDeviceError {
+    /// This should be mapped to a `TypeError`
+    UnsupportedFeature(String),
+    /// This should be mapped to a `OperationError`
+    FailedLimit(String),
+    /// We should return invalid device here,
+    /// but wgpu is currently not able to do that:
+    /// <https://github.com/gfx-rs/wgpu/issues/9535>
+    Other(String),
+}
+
 pub use naga_types::wgsl::language_extension::ImplementedLanguageExtension;
+
+/// Describes a pipeline creation error.
+///
+/// Corresponds to [WebGPU `GPUPipelineError`](https://www.w3.org/TR/webgpu/#gpupipelineerror).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PipelineError {
+    Validation(String),
+    Internal(String),
+}

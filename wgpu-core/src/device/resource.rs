@@ -3619,6 +3619,7 @@ impl Device {
         binding: u32,
         decl: &wgt::BindGroupLayoutEntry,
         view: &'a Arc<TextureView>,
+        texture_init_actions: &mut Vec<TextureInitTrackerAction>,
         used: &mut BindGroupStates,
         snatch_guard: &'a SnatchGuard,
     ) -> Result<
@@ -3664,6 +3665,18 @@ impl Device {
             0,
             NonZeroU64::new(size_of::<ExternalTextureParams>() as u64).unwrap(),
         );
+
+        texture_init_actions.push(TextureInitTrackerAction {
+            texture: view.parent.clone(),
+            range: TextureInitRange {
+                mip_range: view.desc.range.mip_range(view.parent.desc.mip_level_count),
+                layer_range: view
+                    .desc
+                    .range
+                    .layer_range(view.parent.desc.array_layer_count()),
+            },
+            kind: MemoryInitKind::NeedsInitializedMemory,
+        });
 
         Ok(hal::ExternalTextureBinding { planes, params })
     }
@@ -3812,6 +3825,7 @@ impl Device {
                             binding,
                             decl,
                             view,
+                            &mut texture_init_actions,
                             &mut used,
                             &snatch_guard,
                         )?;
